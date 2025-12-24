@@ -1,7 +1,7 @@
-name: bae_push_image_abs
+name: son_pick_and_place_image
 
 image_shape: [3, 240, 320]
-dataset_path: data/baetae/bae_push_image_abs_0728.hdf5
+dataset_path: /home/ws/Downloads/RB10_dataset/pick_and_place/idp_data.hdf5
 
 shape_meta: &shape_meta
   obs:
@@ -11,23 +11,23 @@ shape_meta: &shape_meta
     image1:
       shape: [3, 240, 320]
       type: rgb
-    robot_eef_pos:
+    position:
       shape: [3]
       type: low_dim
-    robot_eef_quat:
+    quat:
       shape: [4]
       type: low_dim
-    # robot_gripper_qpos:
-    #   shape: [1]
-    #   type: low_dim
+    gripper:
+      shape: [1]
+      type: low_dim
   action: 
-    shape: [9]
+    shape: [10]
 
 env_runner:
   _target_: diffusion_policy.env_runner.real_pusht_image_runner.RealPushTImageRunner
 
 dataset:
-  _target_: diffusion_policy.dataset.robomimic_replay_image_dataset.RobomimicReplayImageDataset
+  _target_: diffusion_policy.dataset.son_replay_image_dataset.SonReplayImageDataset
   shape_meta: *shape_meta
   dataset_path: ${task.dataset_path}
   horizon: ${horizon}
@@ -36,9 +36,10 @@ dataset:
   pad_after: ${eval:'${n_action_steps}-1'}
   n_obs_steps: ${dataset_obs_steps}
   # n_latency_steps: ${n_latency_steps}
-  use_cache: True
+  use_cache: False
   seed: 42
   val_ratio: 0.00
+  abs_action: True
   # max_train_episodes: null
   # delta_action: False
 
