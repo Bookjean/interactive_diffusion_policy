@@ -1,16 +1,19 @@
-name: son_pick_and_place_image
+name: son_pick_and_place_wrist_image
 
 image_shape: [3, 240, 320]
-dataset_path: /media/son/son_dataset_2/IL/dataset/rb10_pick_and_place/idp_data.hdf5
+# dataset_path: /media/son/son_dataset_2/IL/dataset/rb10_pick_and_place/idp_data.hdf5
+
+## 2TB SSD에서 읽어오니까 너무 오래걸림. 로컬에 저장해둠
+dataset_path: /home/son/interactive_diffusion_policy/idp_data.hdf5
 
 shape_meta: &shape_meta
   obs:
     image0: # wrist view
       shape: [3, 240, 320]
       type: rgb
-    image1: # global view
-      shape: [3, 240, 320]
-      type: rgb
+    # image1: # global view
+    #   shape: [3, 240, 320]
+    #   type: rgb
     position:
       shape: [3]
       type: low_dim

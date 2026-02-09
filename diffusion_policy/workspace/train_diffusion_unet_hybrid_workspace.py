@@ -124,9 +124,8 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
             **cfg.logging
         )
         wandb.config.update(
-            {
-                "output_dir": self.output_dir,
-            }
+            {"output_dir": str(self.output_dir)},
+            allow_val_change=True,
         )
 
         # configure checkpoint

@@ -1,6 +1,6 @@
 import h5py
 
-file_path = '/home/ws/Downloads/RB10_dataset/pick_and_place/idp_data.hdf5'
+file_path = '/media/son/son_dataset_2/IL/dataset/rb10_pick_and_place/idp_data.hdf5'
 
 with h5py.File(file_path, 'r+') as f:
     if 'data' in f:
