@@ -108,8 +108,13 @@ def main(input, output, robot_ip, match_dataset, match_episode,
     dt = 1/frequency
 
     # pose_repr 설정 (없으면 모두 abs로 처리)
-    from omegaconf import OmegaConf
-    _pose_repr = OmegaConf.to_container(cfg.task.get('pose_repr', {}), resolve=True)
+    pose_repr_cfg = cfg.task.get('pose_repr', {})
+    if OmegaConf.is_config(pose_repr_cfg):
+        _pose_repr = OmegaConf.to_container(pose_repr_cfg, resolve=True)
+    elif isinstance(pose_repr_cfg, dict):
+        _pose_repr = pose_repr_cfg
+    else:
+        _pose_repr = {}
     obs_pose_repr = _pose_repr.get('obs_pose_repr', 'abs')
     action_pose_repr = _pose_repr.get('action_pose_repr', 'abs')
     action_gripper_repr = _pose_repr.get('action_gripper_repr', 'abs')
@@ -124,8 +129,18 @@ def main(input, output, robot_ip, match_dataset, match_episode,
     for key, attr in cfg.task.shape_meta['obs'].items():
         if 'rotation_rep' in attr:
             rot_mat2target[key] = RotationTransformer('matrix', attr['rotation_rep'])
-    rot_mat2target['action'] = RotationTransformer(
-        'matrix', cfg.task.shape_meta['action']['rotation_rep'])
+    use_rot_obs_dict = 'quat' in rot_mat2target
+    if obs_pose_repr == 'relative' and 'quat' not in rot_mat2target:
+        raise KeyError(
+            "task.shape_meta.obs.quat.rotation_rep is required when "
+            "obs_pose_repr='relative'")
+    if action_pose_repr == 'relative':
+        action_rotation_rep = cfg.task.shape_meta['action'].get('rotation_rep', None)
+        if action_rotation_rep is None:
+            raise KeyError(
+                "task.shape_meta.action.rotation_rep is required when "
+                "action_pose_repr='relative'")
+        rot_mat2target['action'] = RotationTransformer('matrix', action_rotation_rep)
 
     obs_res = get_real_obs_resolution(cfg.task.shape_meta)   # obs의 image 해상도 (width, height)
     n_obs_steps = cfg.n_obs_steps   # obs 관측 step 수
@@ -173,7 +188,7 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                 policy.reset()
 
                 # 받은 obs에서 image 정규화 및 다듬기, pose 다듬기
-                if obs_pose_repr == 'relative':
+                if use_rot_obs_dict:
                     obs_dict_np = get_real_relative_obs_dict(
                         env_obs=obs, shape_meta=cfg.task.shape_meta,
                         rot_quat2mat=rot_quat2mat, rot_mat2target=rot_mat2target,
@@ -229,7 +244,7 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                         # run inference; action 예측
                         with torch.no_grad():
                             s = time.time()
-                            if obs_pose_repr == 'relative':
+                            if use_rot_obs_dict:
                                 obs_dict_np = get_real_relative_obs_dict(
                                     env_obs=obs, shape_meta=cfg.task.shape_meta,
                                     rot_quat2mat=rot_quat2mat, rot_mat2target=rot_mat2target,

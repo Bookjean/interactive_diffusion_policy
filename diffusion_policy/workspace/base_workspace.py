@@ -1,4 +1,5 @@
 from typing import Optional
+from collections import OrderedDict
 import os
 import pathlib
 import hydra
@@ -82,7 +83,17 @@ class BaseWorkspace:
         # self.__dict__에 모델 및 가중치 등 파라미터들 저장
         for key, value in payload['state_dicts'].items():
             if key not in exclude_keys:
-                self.__dict__[key].load_state_dict(value, **kwargs)
+                target = self.__dict__[key]
+                if isinstance(target, torch.nn.Module):
+                    try:
+                        target.load_state_dict(value, **kwargs)
+                    except RuntimeError:
+                        fixed_value = _maybe_fix_module_prefix_state_dict(target, value)
+                        if fixed_value is None:
+                            raise
+                        target.load_state_dict(fixed_value, **kwargs)
+                else:
+                    target.load_state_dict(value, **kwargs)
         for key in include_keys:
             if key in payload['pickles']:
                 self.__dict__[key] = dill.loads(payload['pickles'][key])
@@ -144,3 +155,37 @@ def _copy_to_cpu(x):
         return [_copy_to_cpu(k) for k in x]
     else:
         return copy.deepcopy(x)
+
+
+def _maybe_fix_module_prefix_state_dict(module, state_dict):
+    if not isinstance(state_dict, dict):
+        return None
+
+    module_state = module.state_dict()
+    module_keys = [k for k in module_state.keys() if isinstance(k, str)]
+    ckpt_keys = [k for k in state_dict.keys() if isinstance(k, str)]
+    if len(module_keys) == 0 or len(ckpt_keys) == 0:
+        return None
+
+    module_has_prefix = any(k.startswith('module.') for k in module_keys)
+    ckpt_has_prefix = any(k.startswith('module.') for k in ckpt_keys)
+
+    if ckpt_has_prefix and not module_has_prefix:
+        fixed = OrderedDict()
+        for key, value in state_dict.items():
+            if isinstance(key, str) and key.startswith('module.'):
+                fixed[key[len('module.'):]] = value
+            else:
+                fixed[key] = value
+        return fixed
+
+    if module_has_prefix and not ckpt_has_prefix:
+        fixed = OrderedDict()
+        for key, value in state_dict.items():
+            if isinstance(key, str):
+                fixed[f'module.{key}'] = value
+            else:
+                fixed[key] = value
+        return fixed
+
+    return None
