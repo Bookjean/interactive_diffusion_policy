@@ -1,7 +1,7 @@
 import h5py
 import numpy as np
 
-file_path = '/media/son/son_dataset_2/IL/dataset/rb10_pick_and_place/idp_data.hdf5'
+file_path = '/home/son_rb/rb_ws/src/robotory_rb10_ros2/data/0310_2150/pick_tissue_all.hdf5'
 
 with h5py.File(file_path, 'r+') as f:
     if 'data' in f:

@@ -128,7 +128,7 @@ def get_real_relative_obs_dict(
     return obs_dict_np
 
 
-def get_real_relative_action(
+def get_abs_action_from_relative(
         action: np.ndarray,
         env_obs: Dict[str, np.ndarray],
         action_pose_repr: str,
@@ -171,3 +171,49 @@ def get_real_relative_action(
         action_gripper = (action_gripper + env_obs['gripper'][-1]).astype(np.float32)
 
     return np.concatenate([action_pos, action_rot_6d, action_gripper], axis=-1)
+
+
+def get_relative_action_from_abs(
+        action: np.ndarray,
+        env_obs: Dict[str, np.ndarray],
+        action_pose_repr: str,
+        action_gripper_repr: str,
+        rot_quat2mat: RotationTransformer,
+        rot_6d2mat: RotationTransformer,
+        rot_mat2target: dict,
+        ) -> np.ndarray:
+    """단일 팔 단팔용 absolute action → relative action 변환 (`get_abs_action_from_relative`의 역).
+    action: (T, 10) = pos(3) + rot_6d(6) + gripper(1).
+    두 플래그 모두 'relative'이면 이미 relative이므로 그대로 반환(no-op).
+    """
+    if action_pose_repr != 'abs' and action_gripper_repr != 'abs':
+        return action
+
+    action_pos = action[..., :3].copy()
+    action_rot_6d = action[..., 3:9].copy()
+    action_gripper = action[..., 9:10].copy()
+
+    current_pos = env_obs['position'][-1]
+    current_rot_mat = rot_quat2mat.forward(env_obs['quat'][-1])
+    base_pose_mat = _pos_rot_to_pose_mat(
+        current_pos[None], current_rot_mat[None])[0].astype(np.float64)  # (4,4)
+
+    if action_pose_repr == 'abs':
+        # absolute pose → relative pose (backward=False)
+        action_rot_mat = rot_6d2mat.forward(action_rot_6d)
+        abs_pose_mat = _pos_rot_to_pose_mat(action_pos, action_rot_mat)
+        rel_pose_mat = convert_pose_mat_rep(
+            abs_pose_mat.astype(np.float64),
+            base_pose_mat,
+            pose_rep='relative',
+            backward=False)
+        action_pos = rel_pose_mat[..., :3, 3].astype(np.float32)
+        action_rot_6d = rot_mat2target['action'].forward(
+            rel_pose_mat[..., :3, :3]).astype(np.float32)
+
+    if action_gripper_repr == 'abs':
+        # absolute gripper → delta gripper (현재 obs gripper 기준)
+        action_gripper = (action_gripper - env_obs['gripper'][-1]).astype(np.float32)
+
+    return np.concatenate([action_pos, action_rot_6d, action_gripper], axis=-1)
+

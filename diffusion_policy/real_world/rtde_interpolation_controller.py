@@ -4,8 +4,9 @@ import rclpy
 from rclpy.node import Node
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.callback_groups import ReentrantCallbackGroup
-from std_msgs.msg import Int32, Float64, String, Float32MultiArray
-from sensor_msgs.msg import JointState
+from std_msgs.msg import Int32, Float64, String, Float32MultiArray, Float64MultiArray, UInt8
+from sensor_msgs.msg import JointState, Range
+from geometry_msgs.msg import PoseStamped, Pose
 import threading
 import spatialmath.base as smb
 from diffusion_policy.rb10_api.cobot import * 
@@ -113,6 +114,10 @@ def servoJ_rb(robot, current_joint, target_pose, dt, acc_pos_limit=40.0, acc_rot
 def ServoJ(joint_deg, time1=0.002, time2=0.1, gain=0.005, lpf_gain=0.1):
     msg = f"move_servo_j(jnt[{','.join(f'{j:.3f}' for j in joint_deg)}],{time1},{time2},{gain},{lpf_gain})\n"
     SendCOMMAND(msg, CMD_TYPE.MOVE)
+
+def ServoJ_rmp(joint_deg, time1=0.002, time2=0.1, gain=0.02, lpf_gain=0.2):
+    msg = f"move_servo_j(jnt[{','.join(f'{j:.3f}' for j in joint_deg)}],{time1},{time2},{gain},{lpf_gain})\n"
+    SendCOMMAND(msg, CMD_TYPE.MOVE)
     
 
 def ServoL(pose, time1=0.002, time2=0.1, gain=0.005, lpf_gain=0.1):
@@ -133,15 +138,8 @@ class RTDENode(Node):
         self.controller = controller
         self.reentrant_group = ReentrantCallbackGroup()
         
-        # Create subscribers for joint state and gripper position
-        self.joint_state_sub = self.create_subscription(
-            JointState,
-            '/joint_states',
-            self.joint_state_callback,
-            10,
-            callback_group=self.reentrant_group
-        )
-        
+        self.joint_state_pub = self.create_publisher(JointState, '/joint_states', 10)
+
         self.gripper_pos_sub = self.create_subscription(
             Int32,
             '/gripper/present_position',
@@ -150,38 +148,121 @@ class RTDENode(Node):
             callback_group=self.reentrant_group
         )
 
-        self.filtered_distance_sub = self.create_subscription(
-            Float32MultiArray,
-            '/filtered_distance',
-            self.filtered_distance_callback,
+        # 근접 센서 4개 (N, S, E, W) 개별 구독 — APF 노드와 동일한 매핑
+        # proximity_sensor_mapping: [2, 4, 3, 1] → N→/proximity_distance2, S→4, E→3, W→1
+        _sensor_topic_map = [2, 4, 3, 1, 9, 10, 11, 12]  # N, S, E, W 순
+        self._prox_filtered = [float('inf')] * 8  # N, S, E, W 순 (mm)
+        self._prox_lock = threading.Lock()
+        self._rmp_flag_output = 0       # hysteresis 적용된 출력 flag
+        self._rmp_flag_prev = 0         # 직전 출력 flag (0→1 전환 감지용)
+        self._rmp_flag_clear_start = None  # 센서가 300mm 이상으로 올라간 시각 (monotonic)
+        self._rmp_flag_clear_delay = 0.5   # flag 1→0 전환까지 필요한 유지 시간 (초)
+        self._rmp_goal_locked = None    # 회피 시작 시점에 캡처된 goal (flag=0이 될 때 해제)
+        for idx, sensor_id in enumerate(_sensor_topic_map):
+            self.create_subscription(
+                Range,
+                f'/proximity_distance{sensor_id}',
+                lambda msg, i=idx: self._proximity_callback(msg, i),
+                10,
+                callback_group=self.reentrant_group
+            )
+
+        self.avoidance_target_sub = self.create_subscription(
+            Float64MultiArray,
+            self.controller.avoidance_topic_name,
+            self.avoidance_target_callback,
             10,
             callback_group=self.reentrant_group
         )
 
         self.gripper_pub = self.create_publisher(Int32, '/gripper/command', 10)
+        self.rmp_flag_pub = self.create_publisher(UInt8, '/RMP_flag', 10)
+        self.rmp_goal_pub = self.create_publisher(Pose, '/RMP_goal', 10)
 
     def gripper_control(self, target_gripper_qpos):
         msg = Int32()
         msg.data = int(target_gripper_qpos[0])
         self.gripper_pub.publish(msg)
-    
-    def joint_state_callback(self, msg):
-        """Callback for joint state subscription"""
-        with self.controller.joint_state_lock:
-            if len(msg.position) >= 6:
-                # Store joint positions in radians
-                self.controller.joint_state = np.array(msg.position[:6])
+
+    def publish_joint_state(self, joint_position_rad: np.ndarray):
+        msg = JointState()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        # msg.name = ['joint_1', 'joint_2', 'joint_3', 'joint_4', 'joint_5', 'joint_6']
+        msg.name = ['base', 'shoulder', 'elbow', 'wrist1', 'wrist2', 'wrist3']
+        msg.position = [float(x) for x in joint_position_rad[:6]]
+        self.joint_state_pub.publish(msg)
     
     def gripper_pos_callback(self, msg):
         """Callback for gripper position subscription (Int32 message)"""
         with self.controller.gripper_pos_lock:
             self.controller.gripper_pos = msg.data
     
-    def filtered_distance_callback(self, msg):
-        """Callback for filtered distance subscription (Float32MultiArray message)"""
+    def _proximity_callback(self, msg, idx):
+        """Callback for individual proximity sensor (sensor_msgs/Range)."""
+        raw_mm = msg.range if msg.range >= 0 else float('inf')
+        if raw_mm > 1e6:
+            raw_mm = float('inf')
+
+        with self._prox_lock:
+            self._prox_filtered[idx] = raw_mm
+            dist = np.array(self._prox_filtered, dtype=np.float32)
+
         with self.controller.filtered_distance_lock:
-            # Convert Float32MultiArray to numpy array
-            self.controller.filtered_distance = np.array(msg.data, dtype=np.float32)
+            self.controller.filtered_distance = dist
+
+        raw_flag = int(np.any(dist < 250.0))  # 300 mm 기준
+
+        # 1→0 전환에만 debounce 적용 (0→1은 즉시 반응)
+        now = time.monotonic()
+        if raw_flag == 1:
+            # 장애물 감지: 즉시 flag=1, clear 타이머 리셋
+            self._rmp_flag_output = 1
+            self._rmp_flag_clear_start = None
+        else:
+            # 장애물 없음: clear 타이머가 만료되어야 flag=0
+            if self._rmp_flag_output == 1:
+                if self._rmp_flag_clear_start is None:
+                    self._rmp_flag_clear_start = now
+                elif (now - self._rmp_flag_clear_start) >= self._rmp_flag_clear_delay:
+                    self._rmp_flag_output = 0
+                    self._rmp_flag_clear_start = None
+            # output=0이면 그대로 유지
+
+        flag = UInt8()
+        flag.data = self._rmp_flag_output
+        self.rmp_flag_pub.publish(flag)
+
+        if flag.data == 1:
+            # 0→1 전환 시 그 시점의 goal을 한 번만 캡처
+            if self._rmp_flag_prev == 0:
+                with self.controller.rmp_goal_pose_lock:
+                    rmp_pose = self.controller.rmp_goal_pose.copy() if self.controller.rmp_goal_pose is not None else None
+                self._rmp_goal_locked = rmp_pose
+
+            if self._rmp_goal_locked is not None:
+                goal = Pose()
+                goal.position.x = float(self._rmp_goal_locked[0])
+                goal.position.y = float(self._rmp_goal_locked[1])
+                goal.position.z = float(self._rmp_goal_locked[2])
+                quat = R.from_rotvec(self._rmp_goal_locked[3:6]).as_quat()  # [x, y, z, w]
+                goal.orientation.x = float(quat[0])
+                goal.orientation.y = float(quat[1])
+                goal.orientation.z = float(quat[2])
+                goal.orientation.w = float(quat[3])
+                self.rmp_goal_pub.publish(goal)
+        else:
+            # flag=0이 확정되면 locked goal 해제
+            self._rmp_goal_locked = None
+
+        self._rmp_flag_prev = flag.data
+
+    def avoidance_target_callback(self, msg):
+        """Callback for avoidance target joint values (rad). Stores 6 joint positions and timestamp."""
+        print("[DEBUG] avoidance target callback received")
+        joint = np.array(msg.data[:6], dtype=np.float64)
+        with self.controller.avoidance_target_lock:
+            self.controller.avoidance_target_joint = joint
+            self.controller.avoidance_target_timestamp = time.monotonic()
 
 
 class RTDEInterpolationController(mp.Process):
@@ -210,6 +291,9 @@ class RTDEInterpolationController(mp.Process):
             receive_keys=None,
             get_max_k=128,   # 30
             safety_threshold=0.05,  # meters, halt robot if filtered_distance < threshold
+            avoidance_topic_name='/target_q',
+            avoidance_timeout_sec=0.5,
+            rmp_goal_waypoint_index=30,
             ):
         """
         frequency: CB2=125, UR3e=500
@@ -259,6 +343,8 @@ class RTDEInterpolationController(mp.Process):
         self.soft_real_time = soft_real_time
         self.verbose = verbose
         self.safety_threshold = safety_threshold
+        self.avoidance_topic_name = avoidance_topic_name
+        self.avoidance_timeout_sec = avoidance_timeout_sec
 
         # build input queue; 예시 구조로부터 Queue 생성
         example = {
@@ -327,12 +413,18 @@ class RTDEInterpolationController(mp.Process):
         self.gripper_pub = None   # 그리퍼 제어용 퍼블리셔
         
         # ROS subscription state variables (used in run() process)
-        self.joint_state = None
         self.gripper_pos = None
         self.filtered_distance = None
-        self.joint_state_lock = threading.Lock()
         self.gripper_pos_lock = threading.Lock()
         self.filtered_distance_lock = threading.Lock()
+        # Avoidance target (joint values from external topic)
+        self.avoidance_target_joint = None  # (6,) joint values in rad, or None
+        self.avoidance_target_timestamp = None  # time.monotonic() when last received
+        self.avoidance_target_lock = threading.Lock()
+        # RMP goal pose (pose_interp의 n번째 waypoint, run()에서 매 스텝 업데이트)
+        self.rmp_goal_waypoint_index = rmp_goal_waypoint_index
+        self.rmp_goal_pose = None  # (6,) pos + rotvec in m/rad, or None
+        self.rmp_goal_pose_lock = threading.Lock()
 
     # ========= launch method ===========
     def start(self, wait=True):   
@@ -463,21 +555,17 @@ class RTDEInterpolationController(mp.Process):
             
             # init pose
             if self.joints_init is not None:   # None
-                # assert rtde_c.moveJ(self.joints_init, self.joints_init_speed, 1.4)
+                # assert rtde_c.moveJ(self.joints_init, self.joints_i nit_speed, 1.4)
                 MoveJ(self.joints_init, self.joints_init_speed, 1.4)
 
             # main loop
             dt = 1. / self.frequency
 
-            # Wait for initial joint state and gripper position from ROS2 topics
-            time.sleep(0.1)  # Give ROS2 some time to receive messages
-            with self.joint_state_lock:
-                if self.joint_state is None:
-                    # Fallback to API if no ROS message received yet
-                    j = GetCurrentJoint()
-                    current_joint = np.array([j.j0, j.j1, j.j2, j.j3, j.j4, j.j5]) * np.pi / 180   # rad
-                else:
-                    current_joint = self.joint_state.copy()
+            # Wait for initial gripper position from ROS2 topics
+            time.sleep(0.1)  # Give ROS2 some time to receive messages 
+            j = GetCurrentJoint()
+            current_joint = np.array([j.j0, j.j1, j.j2, j.j3, j.j4, j.j5]) * np.pi / 180   # rad
+            self.ros2_node.publish_joint_state(current_joint)
             
             # Get current gripper position from subscription
             with self.gripper_pos_lock:
@@ -501,6 +589,7 @@ class RTDEInterpolationController(mp.Process):
 
             iter_idx = 0
             keep_running = True
+            control_mode = 'following_policy'  # following_policy | following_avoidance | waiting_for_policy_waypoint
 
             t_start = time.monotonic()   # 수동 제어 주기 맞추기
 
@@ -514,6 +603,15 @@ class RTDEInterpolationController(mp.Process):
                 # if diff > 0:
                 #     print('extrapolate', diff)
                 pose_command = pose_interp(t_now)   # 보간 해놓고 현재 시간의 목표 pose 가져옴
+
+                # RMP goal: pose_interp.times[n]의 pose를 callback에서 쓸 수 있도록 업데이트
+                n = self.rmp_goal_waypoint_index
+                rmp_t = pose_interp.times[min(n, len(pose_interp.times) - 1)]
+                rmp_pose_7d = pose_interp(rmp_t)  # (7,) pos + rotvec + gripper
+                with self.rmp_goal_pose_lock:
+                    self.rmp_goal_pose = rmp_pose_7d[:6].copy()  # pos + rotvec only
+
+
                 # vel = 0.5
                 # acc = 0.5
                 # assert rtde_c.servoL(pose_command,   # 로봇 제어 부분! 바꾸기!
@@ -528,25 +626,41 @@ class RTDEInterpolationController(mp.Process):
 
 
                 # RB10 제어 - Get joint state from ROS topic subscription
-                with self.joint_state_lock:
-                    if self.joint_state is not None:
-                        current_joint = self.joint_state.copy()
-                    else:
-                        # Fallback to API if no ROS message received
-                        j = GetCurrentJoint()
-                        current_joint = np.array([j.j0, j.j1, j.j2, j.j3, j.j4, j.j5]) * np.pi / 180   # rad
+                j = GetCurrentJoint()
+                current_joint = np.array([j.j0, j.j1, j.j2, j.j3, j.j4, j.j5]) * np.pi / 180   # rad
+                self.ros2_node.publish_joint_state(current_joint)
                 
                 curr_se3 = rb10.fkine(current_joint)   # m, rad (SE3)
                 curr_pose = se3_to_pos_rotvec(curr_se3)   
 
-                # 매니퓰레이터 및 그리퍼 제어                
-                servoJ_rb(rb10, current_joint, pose_command[:6], dt)   # servoJ (3 pos + 3 rotvec)
+                # Avoidance vs policy: choose arm target
+                with self.avoidance_target_lock:
+                    avoidance_joint = self.avoidance_target_joint.copy() if self.avoidance_target_joint is not None else None
+                    avoidance_ts = self.avoidance_target_timestamp
+                valid_avoidance = (
+                    avoidance_joint is not None
+                    and avoidance_ts is not None
+                    and (t_now - avoidance_ts) <= self.avoidance_timeout_sec
+                )
+                if valid_avoidance:
+                    control_mode = 'following_avoidance'
+                else:
+                    if control_mode == 'following_avoidance':
+                        control_mode = 'waiting_for_policy_waypoint'
+
+                # 매니퓰레이터 및 그리퍼 제어
+                if control_mode in ('following_avoidance', 'waiting_for_policy_waypoint'):
+                    # avoidance joint target이 있으면 그 값으로, 없으면 현재 joint 유지
+                    target_joint_rad = avoidance_joint if avoidance_joint is not None else current_joint
+                    ServoJ_rmp(target_joint_rad * 180 / np.pi)
+                else:
+                    servoJ_rb(rb10, current_joint, pose_command[:6], dt)   # servoJ (3 pos + 3 rotvec)
                 # ServoL(pose_command)                                 # servoL
                 # Control gripper (pose_command[6] is gripper value after converting 6D rot to 3D rotvec)
                 if len(pose_command) >= 7:
                     self.ros2_node.gripper_control([pose_command[6]])
 
-
+                # print("control_mode", control_mode)
                 # 현재 State 저장
                 # update robot state; ringbuffer에 state 저장
                 state = dict()
@@ -626,9 +740,9 @@ class RTDEInterpolationController(mp.Process):
                         target_position = target_pose[:3]   # 3d position, meter
                         target_rotvec = rot6d_to_rotvec(target_pose[3:9])   # 6d rotation -> 3d rot_vec
                         target_gripper = target_pose[9:10]  # gripper (keep as array for concatenation)
-                        target_pose = np.concatenate([target_position, target_rotvec, target_gripper])   # 3d position, 3d rot_vec, 1d gripper (7D)
+                        target_pose_7d = np.concatenate([target_position, target_rotvec, target_gripper])   # 3d position, 3d rot_vec, 1d gripper (7D)
 
-                        print('[DEBUG] target_pose', target_pose)
+                        # print('[DEBUG] target_pose', target_pose_7d)
                         
                         # print('[DEBUG] current rot_vec', curr_pose[3:6])
                         # target_pose[:3] = curr_pose[:3] + target_pose[:3] * MAX_TRANS   # pose, meter
@@ -641,15 +755,28 @@ class RTDEInterpolationController(mp.Process):
                         # translate global time to monotonic time
                         target_time = time.monotonic() - time.time() + target_time   # time.monotonic 기준
                         curr_time = t_now + dt
-                        pose_interp = pose_interp.schedule_waypoint(   # 여기서 pose_interp 갱신
-                            pose=target_pose,
-                            time=target_time,
-                            max_pos_speed=self.max_pos_speed,
-                            max_rot_speed=self.max_rot_speed,
-                            curr_time=curr_time,
-                            last_waypoint_time=last_waypoint_time
-                        )
-                        last_waypoint_time = target_time
+
+                        if control_mode == 'waiting_for_policy_waypoint':
+                            # Re-initialize interpolator from current pose to new waypoint (smooth transition from avoidance)
+                            with self.gripper_pos_lock:
+                                current_gripper = float(self.gripper_pos) if self.gripper_pos is not None else 2100.0
+                            curr_pose_7d = np.concatenate([curr_pose, [current_gripper]])
+                            pose_interp = PoseTrajectoryInterpolator(
+                                times=np.array([t_now, target_time]),
+                                poses=np.array([curr_pose_7d, target_pose_7d])
+                            )
+                            last_waypoint_time = target_time
+                            control_mode = 'following_policy'
+                        else:
+                            pose_interp = pose_interp.schedule_waypoint(   # 여기서 pose_interp 갱신
+                                pose=target_pose_7d,
+                                time=target_time,
+                                max_pos_speed=self.max_pos_speed,
+                                max_rot_speed=self.max_rot_speed,
+                                curr_time=curr_time,
+                                last_waypoint_time=last_waypoint_time
+                            )
+                            last_waypoint_time = target_time
                     else:
                         keep_running = False
                         break

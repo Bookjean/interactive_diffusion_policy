@@ -44,7 +44,7 @@ from diffusion_policy.real_world.real_inference_util import (
     get_real_obs_resolution,
     get_real_obs_dict,
     get_real_relative_obs_dict,
-    get_real_relative_action)
+    get_abs_action_from_relative)
 from diffusion_policy.model.common.rotation_transformer_rel import RotationTransformer
 from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.workspace.base_workspace import BaseWorkspace
@@ -76,12 +76,43 @@ def main(input, output, robot_ip, match_dataset, match_episode,
     ckpt_path = input
     payload = torch.load(open(ckpt_path, 'rb'), pickle_module=dill)
     cfg = payload['cfg']   # yaml에 있던 변수들 설정값
+
+    # pose_repr 설정 (없으면 모두 abs로 처리)
+    pose_repr_cfg = cfg.task.get('pose_repr', {})
+    if OmegaConf.is_config(pose_repr_cfg):
+        _pose_repr = OmegaConf.to_container(pose_repr_cfg, resolve=True)
+    elif isinstance(pose_repr_cfg, dict):
+        _pose_repr = pose_repr_cfg
+    else:
+        _pose_repr = {}
+    obs_pose_repr = _pose_repr.get('obs_pose_repr', 'abs')
+    action_pose_repr = _pose_repr.get('action_pose_repr', 'abs')
+    action_gripper_repr = _pose_repr.get('action_gripper_repr', 'abs')
+    print("obs_pose_repr:", obs_pose_repr)
+    print("action_pose_repr:", action_pose_repr)
+    print("action_gripper_repr:", action_gripper_repr)
+
+    ### pigdm
+    # workspace/policy 인스턴스화 이전에 cfg를 PIGDM용으로 갱신해야 한다.
+    # 또한 체크포인트의 cfg.policy 에는 action_pose_repr/action_gripper_repr 키가 없을 수
+    # 있으므로, struct 모드를 잠시 풀어 새 키를 안전하게 주입한다.
+    use_pigdm = True
+    if use_pigdm == True:
+        OmegaConf.set_struct(cfg, False)
+        cfg._target_ = 'diffusion_policy.workspace.train_diffusion_unet_hybrid_workspace_pigdm.TrainDiffusionUnetHybridPigdmWorkspace'
+        cfg.policy._target_ = "diffusion_policy.policy.diffusion_unet_hybrid_image_policy_pigdm.DiffusionUnetHybridImagePigdmPolicy"
+        cfg.policy.noise_scheduler._target_ = "ddim_scheduler_pigdm.DDIMPIGDMScheduler"
+        # pigdm을 위한 action repr 설정
+        cfg.policy.action_pose_repr = action_pose_repr
+        cfg.policy.action_gripper_repr = action_gripper_repr
+        OmegaConf.set_struct(cfg, True)
+    ###
+
     cls = hydra.utils.get_class(cfg._target_)   # WorkSpace 설정
     workspace = cls(cfg)
     workspace: BaseWorkspace
     workspace.load_payload(payload, exclude_keys=None, include_keys=None)
     # 여기서 workspace.model에 cfg.policy가 들어감
-
 
     # hacks for method-specific setup.
     action_offset = 0
@@ -106,21 +137,6 @@ def main(input, output, robot_ip, match_dataset, match_episode,
 
     # setup experiment
     dt = 1/frequency
-
-    # pose_repr 설정 (없으면 모두 abs로 처리)
-    pose_repr_cfg = cfg.task.get('pose_repr', {})
-    if OmegaConf.is_config(pose_repr_cfg):
-        _pose_repr = OmegaConf.to_container(pose_repr_cfg, resolve=True)
-    elif isinstance(pose_repr_cfg, dict):
-        _pose_repr = pose_repr_cfg
-    else:
-        _pose_repr = {}
-    obs_pose_repr = _pose_repr.get('obs_pose_repr', 'abs')
-    action_pose_repr = _pose_repr.get('action_pose_repr', 'abs')
-    action_gripper_repr = _pose_repr.get('action_gripper_repr', 'abs')
-    print("obs_pose_repr:", obs_pose_repr)
-    print("action_pose_repr:", action_pose_repr)
-    print("action_gripper_repr:", action_gripper_repr)
 
     # RotationTransformer 초기화
     rot_quat2mat = RotationTransformer('quaternion', 'matrix')
@@ -184,7 +200,10 @@ def main(input, output, robot_ip, match_dataset, match_episode,
             # obs 받아오기
             obs = env.get_obs()
 
-            with torch.no_grad():
+            # PIGDM 은 추론 중에도 trajectory 에 대한 autograd.grad 를 계산해야 하므로
+            # no_grad 안에서 돌리면 안된다. 일반 경로는 기존대로 no_grad.
+            grad_ctx = torch.enable_grad() if use_pigdm else torch.no_grad()
+            with grad_ctx:
                 policy.reset()
 
                 # 받은 obs에서 image 정규화 및 다듬기, pose 다듬기
@@ -201,12 +220,20 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                 obs_dict = dict_apply(obs_dict_np, 
                     lambda x: torch.from_numpy(x).unsqueeze(0).to(device))
                 
-                # obs로 action 예측
-                result = policy.predict_action(obs_dict)   # {'action': ~ , 'action_pred': ~}
+                # # obs로 action 예측
+                # result = policy.predict_action(obs_dict)   # {'action': ~ , 'action_pred': ~}
+                # action 예측
+                if use_pigdm == True:
+                    abs_obs = dict_apply(obs, lambda x: torch.from_numpy(x).unsqueeze(0).to(device))
+                    result = policy.predict_action_pigdm(obs_dict, obs)
+                else:
+                    result = policy.predict_action(obs_dict)
+
+                
                 # 실제 실행할 action trajectory
                 action = result['action'][0].detach().to('cpu').numpy()   # [0]은 배치차원 제거, tensor --> np
                 # relative action → absolute action 변환 (abs/abs이면 no-op)
-                action = get_real_relative_action(
+                action = get_abs_action_from_relative(
                     action, obs, action_pose_repr, action_gripper_repr,
                     rot_quat2mat, rot_6d2mat, rot_mat2target)
                 assert action.shape[-1] == 10   # action 차원: 3 pos + 6 rot + 1 gripper
@@ -242,7 +269,10 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                         print(f'Obs latency {time.time() - obs_timestamps[-1]}')
 
                         # run inference; action 예측
-                        with torch.no_grad():
+                        # PIGDM 은 추론 중에도 trajectory 에 대한 autograd.grad 를 계산해야 하므로
+                        # no_grad 안에서 돌리면 안된다. 일반 경로는 기존대로 no_grad.
+                        grad_ctx = torch.enable_grad() if use_pigdm else torch.no_grad()
+                        with grad_ctx:
                             s = time.time()
                             if use_rot_obs_dict:
                                 obs_dict_np = get_real_relative_obs_dict(
@@ -254,16 +284,33 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                                     env_obs=obs, shape_meta=cfg.task.shape_meta)
                             obs_dict = dict_apply(obs_dict_np, 
                                 lambda x: torch.from_numpy(x).unsqueeze(0).to(device))
+                            # # action 예측 
+                            # result = policy.predict_action(obs_dict)
                             # action 예측 
-                            result = policy.predict_action(obs_dict)
+                            if use_pigdm == True:
+                                result = policy.predict_action_pigdm(obs_dict, obs)
+                            else:
+                                result = policy.predict_action(obs_dict)
+
                             # this action starts from the first obs step
                             action = result['action'][0].detach().to('cpu').numpy()   # 실행할 action[Horizon, Action_Dim]
                             # relative action → absolute action 변환 (abs/abs이면 no-op)
-                            action = get_real_relative_action(
+                            action = get_abs_action_from_relative(
                                 action, obs, action_pose_repr, action_gripper_repr,
                                 rot_quat2mat, rot_6d2mat, rot_mat2target)
                             print('Inference latency:', time.time() - s)
                        
+                            # prev_action 저장
+                            # PIGDM scheduler 는 step 함수에서 prev_action.shape[1] == horizon(=16)
+                            # 을 가정하므로, 실행용으로 잘라낸 action 이 아니라 전체 horizon 예측인
+                            # result['action_pred'] 을 abs 로 변환해서 저장한다.
+                            if use_pigdm == True:
+                                action_pred_full = result['action_pred'][0].detach().to('cpu').numpy()
+                                action_pred_full = get_abs_action_from_relative(
+                                    action_pred_full, obs, action_pose_repr, action_gripper_repr,
+                                    rot_quat2mat, rot_6d2mat, rot_mat2target)
+                                policy.get_abs_action(action_pred_full)
+
                         # convert policy action to env actions
                         if delta_action:   # False
                             assert len(action) == 1
