@@ -64,7 +64,7 @@ OmegaConf.register_new_resolver("eval", eval, replace=True)
 @click.option('--init_joints', '-j', is_flag=True, default=False, help="Whether to initialize robot joint configuration in the beginning.")
 @click.option('--steps_per_inference', '-si', default=6, type=int, help="Action horizon for inference.")   # 몇개의 action 실행할건지
 @click.option('--max_duration', '-md', default=60, help='Max duration for each epoch in seconds.')
-@click.option('--frequency', '-f', default=10, type=float, help="Control frequency in Hz.")   # 20Hz ??
+@click.option('--frequency', '-f', default=20, type=float, help="Control frequency in Hz.")   # 20Hz ??
 @click.option('--command_latency', '-cl', default=0.01, type=float, help="Latency between receiving SapceMouse command to executing on Robot in Sec.")
 def main(input, output, robot_ip, match_dataset, match_episode,
     vis_camera_idx, init_joints, 
@@ -96,7 +96,7 @@ def main(input, output, robot_ip, match_dataset, match_episode,
     # workspace/policy 인스턴스화 이전에 cfg를 PIGDM용으로 갱신해야 한다.
     # 또한 체크포인트의 cfg.policy 에는 action_pose_repr/action_gripper_repr 키가 없을 수
     # 있으므로, struct 모드를 잠시 풀어 새 키를 안전하게 주입한다.
-    use_pigdm = True
+    use_pigdm = False
     if use_pigdm == True:
         OmegaConf.set_struct(cfg, False)
         cfg._target_ = 'diffusion_policy.workspace.train_diffusion_unet_hybrid_workspace_pigdm.TrainDiffusionUnetHybridPigdmWorkspace'

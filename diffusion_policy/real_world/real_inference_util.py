@@ -182,11 +182,12 @@ def get_relative_action_from_abs(
         rot_6d2mat: RotationTransformer,
         rot_mat2target: dict,
         ) -> np.ndarray:
-    """단일 팔 단팔용 absolute action → relative action 변환 (`get_abs_action_from_relative`의 역).
+    """단일 팔 단팔용 absolute action을 policy action representation으로 변환.
     action: (T, 10) = pos(3) + rot_6d(6) + gripper(1).
-    두 플래그 모두 'relative'이면 이미 relative이므로 그대로 반환(no-op).
+    action_pose_repr/action_gripper_repr 는 target representation 이며,
+    해당 값이 'relative' 인 성분만 현재 obs 기준으로 relative 변환한다.
     """
-    if action_pose_repr != 'abs' and action_gripper_repr != 'abs':
+    if action_pose_repr != 'relative' and action_gripper_repr != 'relative':
         return action
 
     action_pos = action[..., :3].copy()
@@ -198,7 +199,7 @@ def get_relative_action_from_abs(
     base_pose_mat = _pos_rot_to_pose_mat(
         current_pos[None], current_rot_mat[None])[0].astype(np.float64)  # (4,4)
 
-    if action_pose_repr == 'abs':
+    if action_pose_repr == 'relative':
         # absolute pose → relative pose (backward=False)
         action_rot_mat = rot_6d2mat.forward(action_rot_6d)
         abs_pose_mat = _pos_rot_to_pose_mat(action_pos, action_rot_mat)
@@ -211,9 +212,8 @@ def get_relative_action_from_abs(
         action_rot_6d = rot_mat2target['action'].forward(
             rel_pose_mat[..., :3, :3]).astype(np.float32)
 
-    if action_gripper_repr == 'abs':
+    if action_gripper_repr == 'relative':
         # absolute gripper → delta gripper (현재 obs gripper 기준)
         action_gripper = (action_gripper - env_obs['gripper'][-1]).astype(np.float32)
 
     return np.concatenate([action_pos, action_rot_6d, action_gripper], axis=-1)
-

@@ -228,7 +228,7 @@ class DiffusionUnetHybridImagePigdmPolicy(BaseImagePolicy):
         scheduler.set_timesteps(self.num_inference_steps)
 
         # relative PIGDM
-        if self.action_pose_repr == 'relative':
+        if self.action_pose_repr == 'relative' or self.action_gripper_repr == 'relative':
             # 덮어쓰기
             if self.prev_normalized_relative_action is not None:
                 self.prev_action = self.prev_normalized_relative_action
@@ -287,13 +287,13 @@ class DiffusionUnetHybridImagePigdmPolicy(BaseImagePolicy):
 
         # relative PIGDM
         # abs 형태로 저장되어있던 prev_action을 relative 형태로 변환
-        if self.action_pose_repr == 'relative':
+        if self.action_pose_repr == 'relative' or self.action_gripper_repr == 'relative':
             if self.prev_unnormalized_abs_action is not None:
                 self.prev_unnormalized_relative_action = get_relative_action_from_abs( # obs
                     action=self.prev_unnormalized_abs_action,
                     env_obs=abs_obs,
-                    action_pose_repr='abs',
-                    action_gripper_repr='abs',
+                    action_pose_repr=self.action_pose_repr,
+                    action_gripper_repr=self.action_gripper_repr,
                     rot_quat2mat=self.rot_quat2mat,
                     rot_6d2mat=self.rot_6d2mat,
                     rot_mat2target=self.rot_mat2target)
